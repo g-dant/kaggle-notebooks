@@ -1,0 +1,441 @@
+---
+title: "Corona Virus - GGPLOT EDA + Spatial Statistics"
+author: "Guilherme Vieira Dantas"
+date: "3/13/2020"
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Temporal and Spatial Statistics Guide + Corona Virus Study
+
+**Hello there**, The purpose of this work is to show some basic temporal and spatial statistics tools and apply them in the Corona Virus Datasets. It will serve as a small guide to $2$ different problems:
+
+* Using the facets grid layer of the ggplot library and
+* Applying some spatial statistics tools in a point patterns problem
+* Showing how to calculate the mortality rate ($\approx 3.5 \%$) with its respective standard deviation using a probability Bernouilli's hypothesis test
+
+When we work with spatial statistics, we can handle $3$ different types of problems: pattern of points, surface patterns and continuous surface data. Since we have the latitude and longitude of each occurrence, we will explore the first possibility, and check some common and easy tool that can be applied.
+
+![CoronaVirus](https://s5.static.brasilescola.uol.com.br/be/2020/01/coronavirusbe.jpg)
+
+Spreading around the world with a incredible speed, the Corona Virus became a huge problem, impacting even the global economy and the perspectives that we all have for the future. The classical statistics and the power of different feature visualizations will be explored here in the form of a nice and simple guide, using the R language.
+
+We start by importing the used libraries:
+
+```{r Importing Libraries}
+suppressPackageStartupMessages(library(DT))
+suppressPackageStartupMessages(library(car))
+suppressPackageStartupMessages(library(sf))
+suppressPackageStartupMessages(library(sp))
+suppressPackageStartupMessages(library(maps))
+suppressPackageStartupMessages(library(rnaturalearth))
+suppressPackageStartupMessages(library(rnaturalearthdata))
+suppressPackageStartupMessages(library(spatstat))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(ggcorrplot))
+suppressPackageStartupMessages(library(circlize))
+```
+
+Then, as aways, we read the inputs and take a fast look at each one of them:
+
+```{r Reading Data}
+data_dir <- '/home/x/Desktop/dev/projects/R/SpatialAnalysisCOVID19/novel-corona-virus-2019-dataset/'
+PRINT_MODE = 'datatable'
+print_df <- function(df_in) {
+  if (PRINT_MODE == 'datatable') {
+    return(datatable(df_in))
+  }
+  return(df_in)
+}
+
+df_covid <- read_csv(str_c(data_dir, 'covid_19_data.csv'))
+colnames(df_covid) <- make.names(colnames(df_covid))
+df_covid %>% print_df()
+```
+
+Now, in the next sections, we will try to take different insights by studying the evolution of the COVID19 in different perspectives of view, following a top-bottom approach. So, we will start from the most aggregated features before understanting the specific variables.
+
+# 1. EDA - Part I: Evolution Analysis
+
+## 1.1. Visualization of Aggregated Features
+
+Out first visualization will be the aggregated features. They will be aggregated by countries and regions but we will check the evolution of each one of them. To do that, we will use the GGPLOT library and put our dataset in its long form:
+
+```{r}
+correct_year <- function(date_in) {
+    if (nchar(str_split(date_in, "/")[[1]][[3]]) == 2) {
+        return(str_c(date_in, '20'))
+    }
+    date_in
+}
+
+df_covid$ObservationDate <- sapply(df_covid$ObservationDate, correct_year)
+
+df_covid <- df_covid %>% 
+    mutate(ObservationDate = as.Date(ObservationDate, '%m/%d/%Y'))
+
+df_covid_time_aggregate <- df_covid %>% 
+  group_by(ObservationDate) %>% 
+  summarise_at(vars(Confirmed, Deaths, Recovered), sum) %>% 
+  pivot_longer(cols = c('Confirmed', 'Deaths', 'Recovered'), 
+               names_to = 'Feature', values_to = 'Value')
+
+df_covid_time_aggregate %>% print_df()
+```
+
+The long form shows all different values in the same column. The kind of value will be determined in the "Feature" column, which works as a "metadata" feature of the table.
+
+When we do that, it's easier to plot, with few lines, all all the different variables in just one plot:
+
+```{r, fig.width=15, fig.height=9}
+ggplot(df_covid_time_aggregate, 
+       aes(x = ObservationDate, y = Value, 
+           group = Feature, fill = Feature, colour = Feature)) +
+  geom_line() + geom_point() + facet_wrap(Feature~.) +
+  theme(text = element_text(size = 18)) + xlab('Time') + ylab('Count') + 
+  ggtitle('Total Number of Occurrences')
+  
+```
+
+A huge increasing of the number of confirmed cases can be observed. How many countries do we have in our dataset?
+
+```{r}
+length(unique(df_covid$Country.Region))
+```
+
+Well, using the same facets mechanism we just used here, to show $3$ variables, we will plot all the $89$ possible graphics to monitor the Confirmed, Deaths, and Recovered features! I will also prepare a Ranking, and start the visualization by the countries that experienced the most important increasings in the COVID19 confirmation cases.
+
+## 1.2. COVID19 - Ranking / Studying the Evolution per Country
+
+In this section we will see how the GGPLOT library is a powerful tool. It's based on the "Grammar of Graphics" concept, which divides a graphic in different layers:
+
+![GGPLOT Layers](https://cxlabsblog.files.wordpress.com/2017/10/2017-10-24-14_36_29-visualization-layers-of-ggplot-google-docs.png)
+
+We will use the "facets" layer extensively in this example, to show the evolution of the COVID-19 cases for different countries. 
+
+We will rank the countries and the ranking will be shown starting by the places where the most recent number of confirmed cases are bigger. We will append the raking numbers before the names of the countries:
+
+```{r}
+df_covid_max_count <- df_covid %>% 
+  group_by(Country.Region) %>% 
+  summarise_at(vars(Confirmed, Deaths, Recovered), max) %>% 
+  arrange(desc(Confirmed))
+
+df_covid_max_count$Ranking <- str_pad(as.character(1:nrow(df_covid_max_count)), 2, pad = '0')
+df_covid_max_count$Prefix <- ' - '
+df_covid_max_count <- df_covid_max_count %>% 
+  mutate(Ranked.Country = str_c(Ranking, Prefix, Country.Region)) %>% 
+  mutate(Ranking = Ranking)
+df_covid_max_count %>% print_df()
+
+df_rank_countries <- df_covid_max_count %>% select(Country.Region, Ranking, Ranked.Country)
+df_rank_countries$ObservationDate <- NULL
+df_rank_countries %>% print_df()
+```
+
+Joining these informations with the original table:
+
+```{r}
+df_covid_countries_evolution <- df_covid %>% 
+  group_by(ObservationDate, Country.Region) %>% 
+  summarise_at(vars(Confirmed, Deaths, Recovered), sum) %>% 
+  inner_join(df_rank_countries, by = c('Country.Region' = 'Country.Region'))
+
+df_covid_countries_evolution %>% print_df()
+```
+
+Let's print the ranking in the form of a simple table before start our visualizations:
+
+```{r}
+data.frame(
+  Ranking = (df_covid_countries_evolution %>% 
+               arrange(Ranked.Country) %>% 
+               select(Ranked.Country))$Ranked.Country %>% unique()
+) -> ranking_countries
+
+ranking_countries %>% print_df()
+```
+
+Finally, we can visualize the confirmed, recovered and death cases for each place. We will show the $3$ plots at the same graphic. To do that, we have to employ the "Pivot Longer" function:
+
+```{r, fig.width=15, fig.height=65}
+ggplot(df_covid_countries_evolution %>% pivot_longer(
+           cols = c('Confirmed', 'Deaths', 'Recovered'),
+           names_to = 'Feature', values_to = 'Count'),
+       
+       aes(x = ObservationDate, y = Count, 
+           group = Feature, colour = Feature)) +
+  geom_line() + geom_point() +
+    
+  facet_wrap('.~Ranked.Country', ncol = 3, scale = 'free_y') + 
+    theme(text = element_text(size = 16), legend.position = 'top') +
+    ggtitle('COVID - Evolution for different countries')
+```
+
+# 2. EDA - Part II: Spatial Analysis
+
+In this section, I will plot the spatial patterns of the observed COVID-19 occurrences. To do that, of course, we first need to know the Latitude  / Longitude of the points of interest. We will focus the studies over the number of confirmed cases, since the main interest of this part is to find spatial patterns and try to get insights about the propagation pattern.
+
+```{r}
+df_lat_long_in <- read_csv(str_c(data_dir, 'time_series_covid_19_confirmed.csv'))
+df_lat_long_in %>% print_df()
+```
+
+There are many columns representing different observation times. How many of them do we have?
+
+```{r}
+n_times <- ncol(df_lat_long_in) - 4 # Province/State + Country/Region + Lat + Long
+n_times
+```
+
+Let's also plot the spatial propagation of the virus in the form of a facet grid:
+
+```{r, fig.width=15, fig.height=75}
+
+df_lat_long <- df_lat_long_in
+colnames(df_lat_long) <- c(colnames(df_lat_long)[1:4],
+  str_c('Epoch: ', str_pad(as.character(1:n_times), 2, 'left', '0'),
+        str_c(' - ', colnames(df_lat_long)[5:(4 + n_times)])))
+
+df_lat_long_pivot <- df_lat_long %>% pivot_longer(names_to = 'Confirmed.Time',
+                                                  values_to = 'Confirmed',
+                                                  cols = colnames(df_lat_long)[5:(4 + n_times)])
+
+world <- map_data('world')
+ggplot(legend = FALSE) +
+  geom_polygon(data = world, aes(x = long, y = lat, group = group),
+               color = 'black', fill = 'antiquewhite') +
+  xlab('') + ylab('') + 
+  geom_point(data = df_lat_long_pivot, color = 'black', fill = 'red', 
+             shape = 21, alpha = 0.4,
+             aes(x = Long, y = Lat, fill = Confirmed, size = Confirmed)) +
+  theme_minimal() +
+  scale_size_continuous(range = c(4, 30)) + ggtitle('Occurrences Map - COVID19') +
+  theme(text = element_text(size = 25), legend.position = 'top',
+        panel.background = element_rect(fill='lightblue', colour='blue')) +
+  facet_wrap(.~Confirmed.Time, ncol = 2)
+```
+
+And following those graphics we can notice that the propagation of the Virus started to grow not only in China, but also, as we know, in the US + Europe regions with no significant variations in other countries (until the present date).
+
+So, with all these insights and informations we are ready to use some spatial statistics tools.
+
+# 3. Spatial Statistics - A Fast Guide
+
+Since we want to study the propagation pattern of the Corona Virus, the focus of our studies in this section will be the second order effects (i.e: the spatial relationship among the different places). 
+
+## 3.1. Clark-Evans Hypothesis Test
+
+With this hypothesis test we will test:
+
+$\mathcal{H}_0:$ The points are randomly distributed (and so, we have a Poisson process)
+$\mathcal{H}_1:$ The points tend to be concentrated around certain regions (clustering process)
+
+The test will be unilateral, since we want to test if the obtained statistic $R$ is smaller than $1$. If $R$ is bigger than $1$ we have an ordered and uniform distribution of points which is not something that interest us to study.
+
+We will take all the points, without considering the occurrence date:
+
+```{r}
+ppp_lat_long <- ppp(df_lat_long_in$Long, df_lat_long_in$Lat, c(-180, 180), c(-90, 90))
+ce_test <- clarkevans.test(ppp_lat_long, alternative = 'clustered')
+
+ce_test
+```
+
+It's obvious, but one of the purposes of this notebook is to show some statistical spatial analysis tricks. The Clark Evans test shows us that with a really really tiny p-value, we can **assure**: the point patterns doesn't follow a random (Poisson) distribution.
+
+Basically, the Clark-Evans test is a consequence of central limit theorem based on the nearest neighbours of the points. The test was executed of the set of points where there were at least one observed occurrence.
+
+## 3.2. Measuring the Clustering Force
+
+### 3.2.A. Nearest Neightbous Average
+
+To measure the "clustering force" of the COVID-19 propagation, we can look at the functions F, G and K.
+
+We start by calculating the average nearest neighbour function:
+
+```{r, fig.width=8, fig.weight=8}
+df_ann <- data.frame(ANN = apply(nndist(ppp_lat_long, k = 1:nrow(df_lat_long_in)), 2, FUN = mean))
+df_ann$Point.Index <- 1:nrow(df_lat_long_in)
+ggplot(df_ann, aes(x = Point.Index, y = ANN)) + geom_line(group = 1) + geom_point() +
+  ggtitle('Average Nearest Neighbours') + 
+  ylab('Distance to Nearest Point') + xlab('Ordered Point') +
+  theme(text = element_text(size = 14))
+```
+
+If we have small groups of clustered points, we will have may small values along the Ordered Point axis and then, suddenly, the average mean distance increases significantly, when we reach points that are out of the cluster areas. So, in clustered point patterns we tend to have a convex shape of the curve and that's exactly what we can see here.
+
+To check it in a formal way, we will compute the $K$, $L$ and $G$ functions:
+
+### 3.2.B. K Function
+
+* In the Ripley's K Function, when the observed curve is above the theorical one, we have a signal that the points tends to follow a **clustering pattern**, which is the case here:
+
+```{r}
+plot(envelope(ppp_lat_long, Kest, global = TRUE), main = 'K Function')
+```
+
+### 3.2.C. G Function
+
+* In the case of the G function, we follow the same approach and, then, we confirm here that there is some tendence to have clusters of incidence:
+
+```{r}
+plot(envelope(ppp_lat_long, Gest, global = TRUE), main = 'G Function')
+```
+
+### 3.2.D. F Function
+
+* Finally, with the $F$ function we follow the opposite approach: when the curve is below the theorical line, we have a clustering tendence. So, one more time, we can assure that the COVID-19 is clustered in specific places.
+
+Observing the maps exposed in the previous section, we can say that the virus is, in the current state, clustered in China, Europe and U.S:
+
+```{r}
+plot(envelope(ppp_lat_long, Fest, global = TRUE), main = 'F Function')
+```
+
+# 4. Mortality Rate and Bernoulli Hypothesis Tests
+
+In this section, we will use the informations we have to estimate the probability to die after getting infected with its respective standard deviation for each country and for all the world. 
+
+To do that, we will apply a Bernoulli's Hypothesis Test: if we want to estimate the probability of an event to occur in a population, then, by the central limit theorem, its mean is the percentage of occurrences and its standard deviation can be estimated by the expression $\sqrt{\frac{p_0.(1-p_0)}{N}}$, where $N$ is the number of samples. So, it's normal to find bigger intervals for countries where we have not observed many infections.
+
+This can be visually represented in a plot with error bars:
+
+```{r}
+df_covid
+```
+
+```{r}
+last_date <- max(df_covid$ObservationDate)
+df_covid_last <- df_covid %>% 
+  filter(ObservationDate == last_date) %>%
+  group_by(Country.Region) %>% 
+  summarise_at(vars('Confirmed', 'Deaths', 'Recovered'), sum) %>% 
+  filter(Deaths > 0) %>% 
+  mutate(Mortality = Deaths / Confirmed) %>% 
+  mutate(Std = sqrt((Mortality * (1 - Mortality)) / sqrt(Confirmed)))
+
+df_covid_last
+```
+
+We have approximately $95 \%$ of probability inside a centered interval with a width of $\pm 2$ standard deviations:
+
+![Intervals - Gaussian](https://miro.medium.com/max/24000/1*IZ2II2HYKeoMrdLU5jW6Dw.png)
+
+```{r fig.width = 15, fig.height = 25}
+ggplot(df_covid_last, aes(x = Country.Region, color = Country.Region)) +
+  geom_point(aes(y = Mortality)) +
+  geom_errorbar(aes(ymin = Mortality - 2 * Std, ymax = Mortality + 2 * Std)) +
+  coord_flip() + theme(text = element_text(size = 18), legend.position = 'none') +
+  ylab('Country') + labs(subtitle = 'Hypothesis Test at 90% of Significance')
+```
+
+We have very few samples for some cases where the standard error tends to be too big, So, we will actually get just countries where the number of occurrences is bigger than a minimum number. I will also add a vertical line t show the mortality level around the world.
+
+```{r fig.width = 15, fig.height = 25}
+
+df_covid_last_filtered <- df_covid_last %>% filter(Confirmed > 100)
+mean_mortality <- sum(df_covid_last_filtered$Deaths) / sum(df_covid_last_filtered$Confirmed)
+
+ggplot(df_covid_last_filtered, 
+       aes(x = reorder(Country.Region, Mortality), fill = Country.Region)) +
+  geom_hline(yintercept = mean_mortality, linetype = 'dashed', color = 'red') +
+  geom_errorbar(aes(ymin = Mortality - 2 * Std, ymax = Mortality + 2 * Std)) +
+  geom_point(aes(y = Mortality), size = 10, color = 'black', shape=21) +
+  theme(text = element_text(size = 18), legend.position = 'none') +
+  xlab('Country') + coord_flip() +
+  ggtitle('Mortality Rate') + labs(subtitle = 'Hypothesis Test at 90% of Significance')
+```
+
+The error bars tend to overlap the mean line. But it doesn't happen all the time and, also, we **must** consider that the measuring methods change for different countries!
+
+It's known that in South Korea, almost all the patients are tested, which allows to have better estimates for the mortality and infection rates. For countries like Brazil or Italy,
+the tests are executed just over patients that already present symptoms. Anyway, let's print the "mean mortality":
+
+```{r}
+mean_mortality
+```
+
+So, the mortality rate is something around $3.5 \%$ and this pattern tends be followed in different countries. Anyway, it's not a perfect metric, since the measure basis are different when we change countries!
+
+It makes sense to have a lower mortality rate in South Korea: they detect the presence of the COVID-19 Virus even in assymptomatic cases. But it's hard to understand the reason for the observed variations for all the countries.
+
+# 5. Correlation Analysis - Pearson Test: Correlation of Confirmed Cases
+
+Does it make sense to analyse the correlations of the number of confirmed cases between each pair of countries? Sure! But, in this section, I will also purpose another approach. Anyway, let's start by the correlation:
+
+```{r}
+df_covid_countries_evolution
+```
+
+
+```{r}
+df_covid_countries_evolution %>% 
+  filter(Confirmed > 50) %>% 
+  pivot_wider(id_cols = ObservationDate,
+              names_from = Country.Region, 
+              values_from = Confirmed) -> df_covid_wider
+
+df_covid_wider[is.na(df_covid_wider)] <- 0
+df_covid_wider %>% head()
+```
+
+```{r}
+cor.mtest <- function(mat) {
+  n = ncol(mat)
+  p.mat <- matrix(NA, n, n)
+  diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j])
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  return(p.mat)
+}
+# matrix of the p-value of the correlation
+df_cor <- df_covid_wider %>% as.data.frame() %>% select(-one_of('ObservationDate'))
+df_cor <- Filter(function(x) sd(x) != 0, df_cor)
+p.mat <- cor.mtest(df_cor %>% as.matrix())
+
+p.mat[1:5, 1:5]
+```
+
+```{r fig.width = 15, fig.height = 15}
+cor_mat <- cor(df_cor)
+ggcorrplot(cor_mat, method = 'circle', type = 'upper', insig = 'blank',
+           p.mat = p.mat + (cor_mat > 0.99), sig.level = 0.01) + 
+  theme(legend.position = 'none', text = element_text(size = 18)) +
+  ggtitle('Highly Correlated Significant Features') +
+  labs(subtitle = 'P-Value < 1% and Correlation > 90%')
+```
+
+Notice that I used "p.mat + (cor_mat < 0.99)" as an argument to the p-value matrix of the correlation function. Why? Well, I just wanted to eliminate with the "X" all the squares with correlations smaller than $95 \%$. Considering just the significant correlations that are bigger than $95 \%$ (strong level of Pearson Correlation), 
+                 
+We can also show the main relationships among countries in a chord diagram (taking just correlations bigger than $99 \%$):
+
+```{r fig.width = 10, fig.height = 10}
+chordDiagram(cor_mat * (cor_mat > 0.99))
+```
+
+# 6. Conclusions
+
+We can conclude that:
+
+* **GGPLOT**: The facets label of the GGPLOT library is a powerful and elegant tool to plot and organize many different curves in a grid form. Using the data in a "tidy" form, using the dplyr function "pivot_longer" is really useful when we want to analise multivariate data.
+* **Spatial Analysis**: The clustering tendence **is** statistically significant and we can use the Clark-Evans test as well as the functions $F$, $G$ and $K$ to verify it.
+* **Patterns**: Three patterns of curves were observed: an explosive tendence to get bigger, an stabilization of the confirmed cases and, in some cases, and stabilization followed by a sudden explosion. Trying to understand which factors determine the patterns that will be observed in different countries would be interesting.
+* **Mortality**: The mortality tends to be near of $3.5 \%$ and this pattern tends to be observed in different places
+
+**Thanks for your attention and feel free to comment and to give me suggestions if necessary! AND REMEMBER:**
+
+![Take Care](https://www.elsevier.com/__data/assets/image/0005/974741/WHO-coronavirus-infographic-1.jpg)
+

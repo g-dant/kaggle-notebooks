@@ -1,0 +1,786 @@
+---
+title: "House Prices Prediction: Regression Techniques"
+author: Guilherme D
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+![House](https://encrypted-tbn0.gstatic.com/images?q=tbn%3AANd9GcSjhmm9cL-5MtBbhrwa5P0_HFvW9PP4SEFcOlZZiwxL_rfkTfbh)
+
+The aim of this notebook is to show a complete regression framework, developed in order to solve the classical Kaggle's House Prices Prediction Problem. We will see a detailed explanation of each step, the final results and the conclusions in a detailed way :)
+
+# 0. Step Zero: Taking the Libraries
+
+```{r}
+suppressPackageStartupMessages(library(fastDummies))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(elasticnet))
+suppressPackageStartupMessages(library(forecast))
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(doMC))
+suppressPackageStartupMessages(library(corrplot))
+suppressPackageStartupMessages(library(e1071))
+suppressPackageStartupMessages(library(plotmo))
+suppressPackageStartupMessages(library(glmnet))
+suppressPackageStartupMessages(library(randomForest))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(Metrics))
+suppressPackageStartupMessages(library(DT))
+suppressPackageStartupMessages(library(h2o))
+```
+
+# 1. Importing / Exploring the Data
+
+Here, we will not only import the dataset, we will also classify each column in different categories:
+
+* Year
+* Month
+* Rating
+* Quantitative (formed by integer values, like "number of bathrooms")
+* Numerical (which can be expressed as doubles, like "floor area")
+* Categorical
+
+The classifications will be storef in a metadata table (df.metada):
+
+```{r}
+data_dir <- "/kaggle/input/house-prices-advanced-regression-techniques/"
+output_dir <- "/kaggle/working/" 
+
+file.metadata <- read_file("/kaggle/input/housemetadata/data_classification.txt") %>% 
+  str_split("\r\n") %>% unlist()
+
+file.metadata <- file.metadata[1:(length(file.metadata) - 1)]
+file.metadata <- sapply(file.metadata, function(X)(str_remove(X, "\t")))
+
+correct_names <- function(df.in) {
+  names(df.in) <- make.names(names(df.in))
+  return(df.in)
+}
+
+df.train <- read_csv(str_c(data_dir, "train.csv"), col_types = cols()) %>% correct_names()
+df.test <- read_csv(str_c(data_dir, "test.csv"), col_types = cols()) %>% correct_names()
+df.train_test <- rbind(df.train %>% dplyr::select(-SalePrice), df.test) %>% correct_names()
+
+df.metadata <- data.frame(
+  Feature.Code = file.metadata
+)
+
+df.metadata$Feature <- df.metadata$Feature.Code %>% sapply(function(X)((str_split(X, "_") %>% unlist())[[1]])) %>% make.names()
+df.metadata$Type <- df.metadata$Feature.Code %>% sapply(function(X)((str_split(X, "_") %>% unlist())[[2]]))
+df.metadata$Fake.NA <- df.metadata$Feature.Code %>% sapply(function(X)(length(str_split(X, "_") %>% unlist())) == 3)
+
+rownames(df.metadata) <- NULL
+df.metadata$Feature.Code <- NULL
+
+df.metadata %>% arrange(desc(Type)) %>% datatable()
+```
+
+Also, for some variables, NA values does not represent that the data is effectivelly missing, they have a meaning and it can be read in the data description .txt file. So, for these cases, we say that we have "FAKE NA's" and the Fake.NA column will be equal to TRUE.
+
+So, how many **REAL** missing data occurrences do we have per column? We can check it graphically, after filtering the non FAKE NA's out of the dataframe. It makes a real difference. Without taking the FAKE NA features out, we have the following NA distribution per columns:
+
+```{r}
+get_missing_df <- function(df.in) {
+  df.missing <- df.in %>% sapply(function(X)(sum(is.na(X)))) %>% as.data.frame()
+  df.missing <- df.missing %>% rownames_to_column()
+  names(df.missing) <- c("Feature", "Missing")
+  return(df.missing)
+}
+
+plot_missing_df <- function(df.in) {
+  (ggplot(get_missing_df(df.in) %>% filter(Missing > 0),
+         aes(x = reorder(Feature, -Missing), y = Missing, fill = Feature)) +
+    geom_bar(stat = "identity", color = "black") + xlab("Feature") + ggtitle("Missing Data") +
+    theme(text = element_text(size = 13), 
+          legend.position = "none", axis.text.x = element_text(hjust = 1, angle = 90))) %>% return()
+}
+
+plot_missing_df(df.train_test)
+```
+
+Here we can see the variables that we will take off the filtered missing data analysis dataframe:
+
+```{r}
+df.metadata %>% filter(Fake.NA) %>% select("Feature", "Type") %>% datatable()
+```
+
+Taking the "FAKE NA" elements out and plotting the **real** missing data distribution, we have something much better:
+
+```{r}
+sub.NA <- function(df.in) {
+  df.in %>% replace_na(
+    list(
+      Alley = "NO--ALLEY",
+      BsmtQual = "NO--BASEMENT",
+      BsmtCond = "NO--BASEMENT",
+      BsmtExposure = "NO--BASEMENT",
+      BsmtFinType1 = "NO--BASEMENT",
+      BsmtFinType2 = "NO--BASEMENT",		
+      FireplaceQu = "NO--FIREPLACE",
+      GarageType = "NO--GARAGE",
+      GarageFinish = "NO--GARAGE",
+      GarageQual = "NO--GARAGE",
+      GarageCond = "NO--GARAGE",		
+      PoolQC = "NO--POOL",
+      Fence = "NO--FENCE",
+      MiscFeature = "NO--MISC--FEATURE"
+    )
+  ) %>% return()
+}
+
+df.train <- df.train %>% sub.NA()
+df.test <- df.test %>% sub.NA()
+df.train_test <- df.train_test %>% sub.NA()
+
+plot_missing_df(df.train_test)
+```
+
+Let's take, again, a look at the features that still have missing elements:
+
+```{r}
+df.train_test %>% get_missing_df() %>% filter(Missing > 0) %>% 
+  select("Feature") %>% datatable()
+```
+
+We can actually notice that we have even more "FAKE NA" elements. When a house has no Garage, we can define the Garage Year Construction (GarageYrBlt) as 0 and a similar approach can be executed with other numerical features like the Garage Area or the Total Basement Surface.
+
+After this step, we get an even better situation in our dataset and we notice that we have not many real missing elements:
+
+```{r}
+sub.NA <- function(df.in) {
+  df.in %>% replace_na(
+    list(
+      Alley = "NO--ALLEY",
+      BsmtQual = "NO--BASEMENT",
+      BsmtCond = "NO--BASEMENT",
+      BsmtExposure = "NO--BASEMENT",
+      BsmtFinType1 = "NO--BASEMENT",
+      BsmtFinType2 = "NO--BASEMENT",		
+      FireplaceQu = "NO--FIREPLACE",
+      GarageType = "NO--GARAGE",
+      GarageFinish = "NO--GARAGE",
+      GarageQual = "NO--GARAGE",
+      GarageCond = "NO--GARAGE",		
+      PoolQC = "NO--POOL",
+      Fence = "NO--FENCE",
+      MiscFeature = "NO--MISC--FEATURE",
+      
+      GarageYrBlt = 0,
+      GarageCars = 0,
+      GarageArea = 0,
+      
+      BsmtFinSF1 = 0,			
+      BsmtFinSF2 = 0,
+      BsmtUnfSF = 0,
+      TotalBsmtSF = 0,
+      BsmtFullBath = 0,
+      BsmtHalfBath = 0
+      
+    )
+  ) %>% return()
+}
+
+df.train <- df.train %>% sub.NA()
+df.test <- df.test %>% sub.NA()
+df.train_test <- df.train_test %>% sub.NA()
+
+plot_missing_df(df.train_test)
+```
+
+Taking the "LotFrontage" bar of the last plot out of the graphic, we have:
+
+```{r}
+plot_missing_df(df.train_test %>% select(-LotFrontage))
+```
+
+For some reason, the "Kitchen" feature is in the data description but it's not in the training dataframe or in the test dataframe. For that reason, we will take this term out of the metadata table:
+
+```{r}
+"Kitchen" %in% df.metadata$Feature
+"Kitchen" %in% df.train
+"Kitchen" %in% df.test
+
+df.metadata <- df.metadata[df.metadata$Feature != "Kitchen",]
+```
+
+And we are ready to start our feature engineering step, which will include the missing data imputation part :)
+
+# 2.Feature Engineering
+
+Before working with the missing data imputation, let's create some new features:
+
+* The time since the House was built (in years) - Numerical Feature
+* The time since the House was remodelled (in years) - Numerical Feature
+* The "Is.New" feature will be equal to 1 if the year sold is equal to the building year
+* The "Remodeled" feature will be equal to 1 if the building year is different of the last remodelling year
+* The total surface area - Numerical Feature
+* The total number of bathrooms - Numerical Feature
+
+They are numerical because it makes sense to add numbers to those features. It's different from an ordinary one, that needs only to have an "ordering notion" in its definition.
+
+**(Acknowledgements: Erik Bruin (https://www.kaggle.com/erikbruin/house-prices-lasso-xgboost-and-a-detailed-eda)  Thanks to his notebook these really nice insights were possible! :)**
+
+```{r}
+df.new_features <- data.frame(
+  Feature = c("Time.From.Built", "Time.From.Remod", "Is.New", 
+              "Remodeled", "Total.Surface.Area", "Total.Bathrooms"),
+  Type = c("NUMERICAL", "NUMERICAL", "NUMERICAL", "NUMERICAL", "NUMERICAL", "NUMERICAL"),
+  Fake.NA = c(FALSE, FALSE, FALSE, FALSE, FALSE, FALSE)
+)
+
+df.metadata <- rbind(df.metadata, df.new_features)
+
+add.new_features <- function(df.in) {
+  df.in %>% 
+    
+    mutate(Time.From.Built = YrSold - YearBuilt) %>% 
+    mutate(Time.From.Remod = YrSold - YearRemodAdd) %>% 
+    mutate(Is.New = if_else(YrSold == YearBuilt, 1, 0)) %>%
+    mutate(Remodeled = if_else(YearBuilt != YearRemodAdd, 1, 0)) %>% 
+    mutate(Total.Surface.Area = GrLivArea + TotalBsmtSF) %>% 
+    mutate(Total.Bathrooms = FullBath + (HalfBath / 2) + BsmtFullBath + (BsmtHalfBath / 2)) %>% 
+    
+    mutate_at(vars((df.metadata %>% filter(Type == "YEAR"))$Feature), as.numeric) %>% 
+    mutate_at(vars((df.metadata %>% filter(Type == "YEAR"))$Feature), 
+              function(X)(X - (X %% 10) + if_else(X %% 10 < 5, 0, 5))) %>% 
+    
+    return()
+}
+
+df.train <- df.train %>% add.new_features()
+df.test <- df.test %>% add.new_features()
+df.train_test <- df.train_test %>% add.new_features()
+```
+
+Some rating variables, which are ordinal features, are expressed in characters ("G" for "Good", "B" to "Bad" etc.). So, in this next piece of code, I am correcting this issue:
+
+```{r}
+char.to.rating <- function(variables_list) {
+  
+  df.out <- df.train_test
+  
+  for (curr_var in variables_list) {
+    if (class(df.train_test[[curr_var]]) == "character") {
+      
+      df.rate_group <- df.train_test %>% 
+      full_join(df.train %>% select(Id, SalePrice), by = c("Id" = "Id")) %>% 
+      group_by_at(vars(curr_var)) %>% 
+      summarise(Sale.Price = mean(SalePrice, na.rm = TRUE)) %>% 
+      arrange(Sale.Price)
+    
+      vec.code_map <- (1:nrow(df.rate_group)) %>% as.character()
+      names(vec.code_map) <- df.rate_group[[curr_var]]
+      
+      get.num_rating <- function(X) {
+        if (is.na(X)) { return(0) }
+        return(vec.code_map[[X]] %>% as.numeric())
+      }
+      df.out[[curr_var]] <- sapply(df.out[[curr_var]], get.num_rating)
+      
+      df.out$SalePrice <- NA
+      df.out$SalePrice[1:nrow(df.train)] <- df.train$SalePrice
+    }
+  }
+  
+  return(df.out)
+}
+```
+
+And the rating corrections are store in the "df.train_test.rated" variable:
+
+```{r}
+rating_features <- (df.metadata %>% filter(Type == "RATING"))$Feature
+df.train_test.rated <- char.to.rating(rating_features)
+```
+
+Let's plot a correlogram of the features:
+
+```{r}
+corr.sale_price <- cor(df.train_test.rated %>% filter(Id %in% df.train$Id) %>%
+                         mutate(Log.SalePrice = log(SalePrice)) %>% 
+                         select(one_of(rating_features %>% c("Log.SalePrice"))))
+
+corrplot(corr.sale_price, type = "upper", order = "hclust", method = "pie")
+```
+
+And let's check the correlations with the output feature (the house price itself) in an ordered barplot:
+
+```{r}
+df.corr_output <- data.frame(
+  Feature = names(corr.sale_price['Log.SalePrice',]),
+  Value = unname(corr.sale_price['Log.SalePrice',])
+) %>% filter(Feature != "Log.SalePrice")
+
+ggplot(df.corr_output, aes(x = reorder(Feature, -Value), y = Value)) + 
+  geom_bar(stat = "identity", color = "black", mapping = aes(fill = Feature)) +
+  theme(text = element_text(size = 13), 
+          legend.position = "none", axis.text.x = element_text(hjust = 1, angle = 90)) +
+  xlab("Feature") + ylab("Correlation") + ggtitle("Correlation with Log(Sale Price)") +
+  
+  geom_hline(yintercept = 0.8, color = "red", linetype = 2)
+```
+
+We have just one feature that has a correlation bigger than $80 \%$ with the output. So, multicolinearity will not be a significant problem in out regression models.
+
+# 3. Missing Data Imputation
+
+Now, let's take care of the missing data. We will start by converting all the non numerical features into characters:
+
+```{r}
+cat2char <- function(df.in, df.meta, num_type_list) {
+  char_vars <- (df.metadata %>% filter(!(Type %in% num_type_list)))$Feature %>% c("Id")
+  char_vars[char_vars == "OverallQual"] <- NULL
+  return(df.in %>% mutate_at(.vars = char_vars, .funs = as.character))
+}
+
+df.metadata[df.metadata[["Feature"]] == "OverallQual",]$Type <- "RATING.NUM"
+
+df.train <- df.train %>% cat2char(df.metadata, c("NUMERICAL", "QUANT", "RATING.NUM")) %>% select(-LotFrontage)
+df.test <- df.test %>% cat2char(df.metadata, c("NUMERICAL", "QUANT", "RATING.NUM")) %>% select(-LotFrontage)
+
+df.train_test <- df.train_test %>% 
+  cat2char(df.metadata, c("NUMERICAL", "QUANT", "RATING.NUM")) %>%
+  select(-LotFrontage)
+```
+
+And, for each character column, we will insert the most frequent category in the missing data positions. For numerical types, we will insert the median of the values in the rows with no data values:
+
+```{r}
+get_incomplete_cols <- function(df.in) { return((get_missing_df(df.in) %>% filter(Missing > 0))$Feature) }
+input_median <- function(df.in) {
+  incomplete_cols <- get_incomplete_cols(df.in)
+  for (curr_col in incomplete_cols) {
+    if (is.character(curr_col)) {
+      df.in[[curr_col]][is.na(df.in[[curr_col]])] <- sort(df.in[[curr_col]], decreasing = TRUE)[[1]]
+    } else {
+      df.in[[curr_col]][is.na(df.in[[curr_col]])] <- median(df.in[[curr_col]], na.rm = TRUE)
+    }
+  }
+  return(df.in)
+}
+
+df.train <- df.train %>% input_median()
+df.test <- df.test %>% input_median()
+df.train_test <- df.train_test %>% input_median()
+
+df.train_test %>% head() %>% datatable()
+```
+
+# 4. Dummy Variables and Redundant Features
+
+Finally, we can separe the training and testing set:
+
+```{r}
+char_cols <- names(df.train_test)[sapply(df.train_test, class) == "character"]
+
+X.train.num <- df.train %>% select(-one_of(char_cols)) %>% select(-SalePrice)
+X.train.cat <- df.train %>% select(one_of(char_cols)) %>% select(-Id)
+
+X.test.num <- df.test %>% select(-one_of(char_cols))
+X.test.cat <- df.test %>% select(one_of(char_cols)) %>% select(-Id)
+
+Y.train <- df.train$SalePrice
+```
+
+And we can also dummify the categorical columns:
+
+```{r}
+X.train_test.num <- rbind(X.train.num, X.test.num)
+X.train_test.cat <- rbind(X.train.cat, X.test.cat)
+
+X.train_test.dummy <- dummy_cols(X.train_test.cat, remove_first_dummy = TRUE, split = "__")
+X.train_test.dummy <- X.train_test.dummy[, (ncol(X.train_test.cat) + 1):(ncol(X.train_test.dummy))]
+
+X.train.dummy <- X.train_test.dummy[1:nrow(X.train.cat),]
+X.test.dummy <- X.train_test.dummy[(nrow(X.train.cat) + 1):(nrow(X.train_test.dummy)),]
+
+ncol(X.train_test.dummy)
+```
+
+Notice that:
+
+* If a feature has aways the same value in the training or in the testing sets, that feature can be considered redundant
+* It happens because, if the value is aways the same in the training set, then the model will not be able to learn how to work with the feature in question and when the feature is aways the same in the testing set, then it's better to try to create a model that doesn't use the lacking information: it's better to let the model learn how to preview the output based on all the other columns, that may contain informations about the variables that were dropped out
+
+```{r}
+cs.train.dummy <- colSums(X.train.dummy) %>% as.data.frame() %>% rownames_to_column()
+names(cs.train.dummy) <- c("Feature", "Sum")
+redundant_train_vars <- (cs.train.dummy %>% filter(Sum == 0))$Feature
+redundant_train_vars
+```
+
+```{r}
+cs.test.dummy <- colSums(X.test.dummy) %>% as.data.frame() %>% rownames_to_column()
+names(cs.test.dummy) <- c("Feature", "Sum")
+redundant_test_vars <- (cs.test.dummy %>% filter(Sum == 0))$Feature
+redundant_test_vars
+```
+
+```{r}
+redundant_vars <- union(redundant_train_vars, redundant_test_vars)
+redundant_vars
+```
+
+```{r}
+X.train.dummy <- X.train.dummy %>% select(-one_of(redundant_vars))
+X.test.dummy <- X.test.dummy %>% select(-one_of(redundant_vars))
+X.train_test.dummy <- X.train_test.dummy %>% select(-one_of(redundant_vars))
+```
+
+```{r}
+ncol(X.train_test.dummy)
+```
+
+Another type of redundance happens when we categorize many related features: in many cases we have the same information - 'NO GARAGE'. So,we can just check for similar pairs of columns and eliminate the redundant data:
+
+```{r}
+ncols_iter <- ncol(X.train_test.dummy)
+
+idx_cols_to_remove <- c()
+for (i in 1:(ncols_iter - 1)) {
+  for (j in (i + 1):(ncols_iter)) {
+    if (all(X.train_test.dummy[[i]] == X.train_test.dummy[[j]])) {
+      idx_cols_to_remove <- c(idx_cols_to_remove, j)
+    }
+  }
+}
+
+cols_to_remove <- unique(names(X.train_test.dummy[, idx_cols_to_remove]))
+print(cols_to_remove)
+```
+
+```{r}
+X.train_test.dummy <- X.train_test.dummy %>% select(-one_of(cols_to_remove))
+X.train.dummy <- X.train.dummy %>% select(-one_of(cols_to_remove))
+X.test.dummy <- X.test.dummy %>% select(-one_of(cols_to_remove))
+```
+
+```{r}
+ncol(X.train_test.dummy)
+```
+
+And, as we can see, it was possible to take many redundant or useless columns out of the dataframe with this approach :)
+
+# 5. Sparse Data and Skewness
+
+Since we are going to work with a conventional regression technique (elasticnet), we have to worry with $2$ problems: the sparsity of some features and the high skewness that we can find for some columns. Let's take a look at dummy columns ordered by "sparsity", i.e, starting by the columns with less $1$ terms until the columns with more distributed zero's and one's:
+
+```{r}
+df.count_dummy <- sapply(X.train_test.dummy, function(X)(sum(X))) %>% as.data.frame() %>% rownames_to_column()
+names(df.count_dummy) <- c("Feature", "Count.Ones")
+df.count_dummy <- df.count_dummy %>% arrange(Count.Ones)
+df.count_dummy %>% datatable()
+```
+
+Well, let's start by standardizing each column of the dataframe:
+
+```{r}
+standardize <- function(X) {
+  return((X - mean(X)) / (sd(X)))
+}
+
+X.train_test <- cbind(X.train_test.num, X.train_test.dummy) %>% mutate_all(~standardize(.))
+X.train <- X.train_test[1:nrow(X.train.num),]
+X.test <- X.train_test[(1 + nrow(X.train.num)):nrow(X.train_test.num),]
+```
+
+And let's check the values distribution of the Sale Price:
+
+```{r}
+ggplot(df.train, aes(x = SalePrice)) + geom_histogram(fill = "lightblue", bins = 50, color = "black") +
+  xlab("Sale Price") + ylab("Density") + ggtitle("Output Distribution")
+```
+
+The Sale Price seems to be pretty assymetric. Also, if we check the scoring criteria of this problem, we will see that it's Random Mean Square Error (RMSE) of the output's **LOGARITHM**. So, it's perfect to take the log of the output: it's a reasonable technique to reduce the data skewness and we will be able to evaluate our model according to the Kaggle's judgement reference:
+
+```{r}
+ggplot(df.train, aes(x = log(SalePrice))) + geom_histogram(fill = "lightblue", bins = 50, color = "black")  +
+  xlab("Sale Price") + ylab("Density") + ggtitle("Output Distribution")
+```
+
+Much better! Another way to see that our dataset has a smaller assymetry and that its log is even closer to a normal distribution is to show the Normal Quantile-Quantile plot of the distribution before and after the log transformation: 
+
+### Select the Figure of Interest Below { .tabset }
+
+#### QQPlot Before LOG Transformation
+```{r}
+qqnorm(df.train$SalePrice, main = "Normal Q-Q Plot Before LOG Transformation")
+qqline(df.train$SalePrice)
+```
+
+
+#### QQPlot After LOG Transformation
+```{r}
+qqnorm(log(df.train$SalePrice), main = "Normal Q-Q Plot After LOG Transformation")
+qqline(log(df.train$SalePrice))
+```
+
+### .
+
+We can also check the Skewness value before and after the log-transformation, and test if $Log(Y_{SalePrice})$ is normal with a Shapiro Test:
+
+```{r}
+print(str_c("Skewness before log-transform: ", as.character(skewness(df.train$SalePrice))))
+print(str_c("Skewness after log-transform: ", as.character(skewness(log(df.train$SalePrice)))))
+
+shapiro.test(log(df.train$SalePrice))
+```
+
+With a really small p-value, smaller than $5 \%$, we can say, with a high significance level that the logarithm of the Sale Price follows a gaussian distribution!
+
+Let's try to check the skewness distribtion of the input features:
+
+$$ \mathbb{E}[X^3-\mathbb{E}[X]^3] = \mu_3 $$
+
+```{r}
+df.predictors_skewness <- X.train_test.num %>% sapply(skewness) %>% as.data.frame() %>% rownames_to_column()
+names(df.predictors_skewness) <- c("Feature", "Skewness")
+
+ggplot(mapping = aes(x = Skewness)) + 
+  geom_histogram(data = df.predictors_skewness, fill = "red", color = "black", alpha = 0.2, bins = 50) +
+  ylab("Density") + ggtitle("Initial Predictors Skewness")
+```
+
+We will consider that features with a skewness bigger than $3$ ($\mu_3 > 3$) are strongly assimetrical. Let's list them:
+
+```{r}
+lambda_list = list()
+range01 <- function(x){ (x - min(x)) / (max(x) - min(x)) }
+
+num_cols <- (df.metadata %>% filter(Type == "NUMERICAL"))$Feature
+num_cols <- num_cols[num_cols != "LotFrontage"]
+
+X.train_test.boxcox <- X.train_test %>% 
+  mutate_at(vars(num_cols), scale) %>% mutate_at(vars(-num_cols), range01)
+
+skewed_vars <- names(X.train_test.num)[sapply(X.train_test.num, function(X)(skewness(X) > 3))]
+
+print(skewed_vars)
+```
+
+To try to solve that problem, we can apply a BoxCox transformation for these features:
+
+$$ \lambda \neq 0 \rightarrow Y_i(\lambda) = \frac{X^\lambda - 1}{\lambda}  $$
+$$ \lambda = 0 \rightarrow Y_i(\lambda) = \lim_{\lambda \rightarrow 0 }\left( \frac{X^\lambda - 1}{\lambda} \right) = log(X)  $$
+
+The lambda values will be selected so that the output distribution will follow a distribution that is the closest as possible to a gaussian distribution:
+
+```{r}
+skewed_vars <- skewed_vars[!(skewed_vars %in% c("BsmtHalfBath", "KitchenAbvGr", "Is.New"))]
+for (curr_feature in skewed_vars) {
+  
+  opt_lambda <- BoxCox.lambda(X.train_test.boxcox[[curr_feature]])
+  X.train_test.boxcox[[curr_feature]] <- scale(BoxCox(X.train_test.boxcox[[curr_feature]], opt_lambda))
+  skewed_vars <- c(skewed_vars, curr_feature)
+    
+  if (is.na(opt_lambda)) { print(curr_feature) }
+}
+```
+
+The blue histogram is the distribution of the skewness of each column after applying a BoxCox transformation over the highly skewed features:
+
+```{r}
+df.predictors_skewness.boxcox <- X.train_test.boxcox %>% 
+  dplyr::select(one_of(names(X.train_test.num))) %>% 
+  sapply(skewness) %>% 
+  as.data.frame() %>% 
+  rownames_to_column()
+
+names(df.predictors_skewness.boxcox) <- c("Feature", "Skewness")
+
+ggplot(mapping = aes(x = Skewness)) + 
+  
+  geom_histogram(data = df.predictors_skewness.boxcox, fill = "blue", color = "black", alpha = 0.2, bins = 50) +
+  geom_histogram(data = df.predictors_skewness, fill = "red", color = "black", alpha = 0.2, bins = 50) +
+  
+  ylab("Density") + ggtitle("Initial Predictors Skewness") + geom_vline(xintercept = 3, color = "red", linetype = 2)
+```
+
+We solved the problem to almost all the features, which is pretty good. We will keep these $2$ skewed features in out dataset and start our next step: the model selection.
+
+# 6. Model Selection
+
+In this section, I will not GridSearch the hyperparameters over all the possibilities again and again. I will already use the optimal hyperparameters found in my first execution of the script. The original hyper-parametergrids are commented.
+
+A K-Fold Cross Validation with $10$ folds and $3$ repetitions is applied.
+
+```{r}
+X.train.boxcox <- X.train_test.boxcox[1:nrow(X.train),]
+X.test.boxbox <- X.train_test.boxcox[(nrow(X.train) + 1):(nrow(X.train_test)),]
+```
+
+```{r}
+control_cv <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+registerDoMC(cores = 4)
+set.seed(2020)
+```
+
+```{r}
+tunegrid_elasticnet <- expand.grid(
+  alpha = 0.02, # seq(0, 1, 0.01)
+  lambda = 0.16 # seq(0, 1, 0.01)
+)
+
+enet_fit <- train(x = X.train.boxcox,
+                  y = log(Y.train),
+                  method = "glmnet", metric = "RMSE",
+                  tuneGrid = tunegrid_elasticnet,
+                  tr_control= control_cv)
+
+enet_fit$bestTune
+```
+
+```{r}
+enet_fit$results$RMSE %>% min()
+```
+
+In our first version, we have a LOG-RMSE error of $14.33 \%$, and we can try to improve this. Let's plot the residuals curves of the model:
+
+```{r fig.width = 10, fig.height = 10}
+plotres(enet_fit$finalModel)
+```
+
+We can see that we have $3$ really strong outliers. Let's eliminate it and re-run the model:
+
+```{r}
+tunegrid_elasticnet <- expand.grid(
+  alpha = 0.02, # seq(0, 1, 0.01), # OPTIMAL == 0.04
+  lambda = 0.16 # seq(0, 1, 0.01) # OPTIMAL == 0.08
+)
+
+enet_fit.no_outliers <- train(x = X.train.boxcox[c(-633, -1299, -1325),],
+                              y = log(Y.train[c(-633, -1299, -1325)]),
+                              method = "glmnet", metric = "RMSE",
+                              tuneGrid = tunegrid_elasticnet,
+                              tr_control= control_cv)
+
+enet_fit.no_outliers$bestTune
+```
+
+```{r}
+enet_fit.no_outliers$results$RMSE %>% min()
+```
+
+```{r fig.width = 10, fig.height = 10}
+plotres(enet_fit.no_outliers$finalModel)
+```
+
+We still have some outliers, let's remove them again and re-run:
+
+```{r}
+tunegrid_elasticnet <- expand.grid(
+  alpha = 0.02, # seq(0, 1, 0.01), # OPTIMAL == 0.19
+  lambda = 0.16 # seq(0, 1, 0.01) # OPTIMAL == 0.02
+)
+
+enet_fit.no_outliers2 <- train(x = X.train.boxcox[c(-633, -1299, -1325, -463, -524, -826),],
+                               y = log(Y.train[c(-633, -1299, -1325, -463, -524, -826)]),
+                               method = "glmnet", metric = "RMSE",
+                               tuneGrid = tunegrid_elasticnet,
+                               tr_control= control_cv)
+
+enet_fit.no_outliers2$results$RMSE %>% min()
+```
+
+We have a much better RMSE and we have no more significant outliersas we can see in the following plot:
+
+```{r fig.width = 10, fig.height = 10}
+plotres(enet_fit.no_outliers2$finalModel)
+```
+
+Generating the final results:
+
+```{r}
+X.model <- X.train.boxcox[c(-633, -1299, -1325, -463, -524, -826),] 
+Y.model <- log(Y.train[c(-633, -1299, -1325, -463, -524, -826)])
+X.test.model <- X.test.boxbox %>% as.matrix()
+
+enet_output <- glmnet(x = X.model %>% as.matrix(), y = Y.model %>% as.matrix(), 
+                      alpha = 0.02, lambda = 0.16) %>% predict(X.test.model)
+
+data.frame(
+  Id = df.test$Id,
+  SalePrice = exp(enet_output) %>% unname() %>% as.vector()
+) %>% write.csv(file = str_c(output_dir, "output_single_enet.csv"), row.names = FALSE, col.names = c("Id", "SalePrice"))
+```
+
+Just an observation: we can visualize the outliers in another angle of view. If we plot a BoxPlot per Overall Rating and mark the outliers with a red "X", we have:
+
+```{r fig.width = 10, fig.height = 5}
+ggplot(df.train, aes(x = OverallQual, y = log(SalePrice), fill = as.character(OverallQual), group = OverallQual)) + 
+  geom_boxplot() + 
+  theme(legend.position = "none", text = element_text(size = 13)) + 
+  ggtitle("BoxPlot per Overall Quality") +
+  xlab("Overall Quality") + ylab("Log(SalePrice)") +
+  geom_point(data = df.train[c(633, 1299, 1325, 463, 524),], 
+             aes(x = OverallQual, y = log(SalePrice)), color = "red", shape = "X", size = 5)
+  
+```
+
+We can see that the outliers represent houses with prices that are not correspondent with the Overall Quality. It includes $2$ really cheap houses with a really high OverallQual value.
+
+# 7. Auto ML Approach
+
+In the previous section, we could not only find a reasonable first model (an Elastic Net), we could also find outliers in our dataset and eliminate them improving our results.
+
+In this section, we will use the dataset with the outliers correction in combination with the AutoML algorithm of the H2O library.
+
+```{r echo = T, results = 'hide'}
+h2o.init()
+
+training_frame_in <-
+  cbind(as.data.frame(X.model), data.frame(Target = Y.model)
+  ) %>% sapply(as.numeric)
+
+colnames(training_frame_in) <- make.names(colnames(training_frame_in))
+training_frame_h2o <- as.h2o(training_frame_in)
+
+aml <- h2o.automl(
+  x = setdiff(colnames(training_frame_in), "Target"),
+  y = "Target",
+  training_frame = training_frame_h2o
+)
+```
+
+```{r}
+df_leaderboard_aml <- aml@leaderboard %>% as.data.frame() %>% select(model_id, rmse)
+colnames(df_leaderboard_aml) <- c('Model', 'RMSE')
+df_leaderboard_aml
+```
+
+The best model is **slightly** better than the Elastic Net. We will also output the h2o estimator and try to get a better score.
+
+```{r}
+ggplot(df_leaderboard_aml, aes(x = RMSE)) + geom_histogram(fill = 'lightblue', bins = 100, color = "black") +
+  xlab("Score") + ylab("Density") + ggtitle("Scores Distribution") +
+  theme(text = element_text(size = 15)) + geom_vline(xintercept = enet_fit.no_outliers2$results$RMSE %>% min(),
+                                                     color = "red", linetype = "dashed") +
+  labs(subtitle = "(The red dashed line is the score of the Elastic Net)")
+  
+```
+
+```{r echo = T, results = 'hide'}
+h2o.pred <- h2o.predict(aml, X.test.model %>% as.data.frame() %>% sapply(as.numeric) %>% as.h2o())
+data.frame(
+  Id = df.test$Id,
+  SalePrice = exp(h2o.pred$predict %>% as.vector()) %>% unname() %>% as.vector()
+) %>% write.csv(file = str_c(output_dir, "df_output_h2o.csv"), 
+                row.names = FALSE, col.names = c("Id", "SalePrice"))
+```
+
+# 8. Conclusions
+
+It was possible to reach a nice score with just a single regression technique. I took the Elastic Net regularization mechanism because it's a generalization of the Lasso Regression and the Ridge Regression. So, with the parameter that distributes the regularization term between the $L_1$ and the $L_2$ norm of the error, we can, in the Grid Search step, find a suitable amount of regularization with a high degree of flexibility.
+
+![ElasticNet](https://hackernoon.com/hn-images/1*gAmw-_z6v4bG9HcnPSAK3Q.png)
+
+A small improvement could be obtained with the use of the H2O AutoML function. I believe this score can still be improved in future versions, but I'm already near of the top $25 \%$, which is not a huge result but is good enough :)
+
+# 9. Acknowledgements
+
+1. Erik Bruin and its excellent data analysis: https://www.kaggle.com/erikbruin/house-prices-lasso-xgboost-and-a-detailed-eda
+
+2. Serigne and its great framework to find an optimal model: https://www.kaggle.com/serigne/stacked-regressions-top-4-on-leaderboard
